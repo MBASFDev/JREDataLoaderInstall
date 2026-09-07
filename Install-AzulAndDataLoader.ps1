@@ -4,10 +4,8 @@
     Windows version - uses only built-in PowerShell/Windows tools, no Python required.
 
 .NOTES
-    Run in an elevated (Administrator) PowerShell for a system-wide install and
-    machine-wide JAVA_HOME. Run without elevation for a per-user install.
-
     Behavior summary:
+      - If not running elevated, prompts (pop-up) to relaunch as Administrator.
       - If NEITHER Java nor Data Loader is found -> installs both (latest).
       - If EITHER is found but out of date -> updates whichever is out of date.
       - If BOTH are found and already latest -> shows a pop-up confirming this
@@ -37,6 +35,43 @@ function Show-Popup($message, $title = "Installer") {
 }
 
 # ---------------------------------------------------------------------------
+# PHASE 0: Ensure the script is running elevated (Administrator).
+# If not, prompt the user to confirm, then relaunch elevated automatically.
+# This works whether the script was downloaded and run locally, or invoked
+# via "irm <url> | iex" (in that case we re-launch using the same URL).
+# ---------------------------------------------------------------------------
+if (-not (Test-Admin)) {
+    Add-Type -AssemblyName System.Windows.Forms | Out-Null
+    $response = [System.Windows.Forms.MessageBox]::Show(
+        "This installer needs Administrator rights to install Java and Data Loader system-wide.`n`nRelaunch this script as Administrator now?",
+        "Administrator rights required",
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Warning
+    )
+
+    if ($response -eq [System.Windows.Forms.DialogResult]::Yes) {
+        Write-Host "Relaunching elevated ..." -ForegroundColor Yellow
+
+        # $PSCommandPath is empty when run via "irm <url> | iex" (piped, no
+        # local file) - in that case, relaunch by re-downloading + running
+        # from the same URL. Otherwise, relaunch the local script file.
+        if ($PSCommandPath) {
+            $relaunchArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$PSCommandPath`"")
+            if ($Silent) { $relaunchArgs += "-Silent" }
+            Start-Process -FilePath "powershell.exe" -ArgumentList $relaunchArgs -Verb RunAs
+        } else {
+            $scriptUrl = "https://raw.githubusercontent.com/MBASFDev/JREDataLoaderInstall/main/Install-AzulAndDataLoader.ps1"
+            $relaunchCmd = "irm $scriptUrl | iex"
+            Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $relaunchCmd) -Verb RunAs
+        }
+        exit 0
+    } else {
+        Write-Host "Cannot continue without Administrator rights. Exiting." -ForegroundColor Red
+        exit 1
+    }
+}
+
+# ---------------------------------------------------------------------------
 # PHASE 1: Detect system specs
 # ---------------------------------------------------------------------------
 Write-Host "=== Phase 1: Detecting system specifications ===" -ForegroundColor Cyan
@@ -47,8 +82,7 @@ elseif ($arch -eq "ARM64") { $zuluArch = "aarch64" }
 else { $zuluArch = "x86" }
 
 Write-Host "Detected OS: Windows | Arch: $zuluArch"
-$isAdmin = Test-Admin
-Write-Host "Running as Administrator: $isAdmin"
+Write-Host "Running as Administrator: $true"
 
 # ---------------------------------------------------------------------------
 # PHASE 2: Prompt for install directory
@@ -83,12 +117,10 @@ if (-not $packages -or $packages.Count -eq 0) {
 $pkgUuid = $packages[0].package_uuid
 $detail = Invoke-RestMethod -Uri "$azulApi$pkgUuid" -Method Get
 $downloadUrl = $detail.download_url
-$latestJavaVersion = ($detail.java_version -join ".")   # e.g. "21.0.4.7"
+$latestJavaVersion = ($detail.java_version -join ".")
 Write-Host "Latest Azul Zulu JRE available: $latestJavaVersion"
 
 function Get-InstalledJavaVersion {
-    # Try java on PATH first, then a previously-set JAVA_HOME, so this works
-    # even if PATH hasn't been refreshed in the current session.
     $javaCmd = Get-Command java -ErrorAction SilentlyContinue
     $javaExePath = $null
     if ($javaCmd) {
@@ -114,7 +146,6 @@ function Get-InstalledJavaVersion {
 }
 
 function Compare-VersionStrings($installed, $latest) {
-    # Returns $true if installed >= latest. Handles differing segment counts.
     $instParts = ($installed -split '[._]') | ForEach-Object { [int]($_ -replace '\D', '0') }
     $latestParts = ($latest -split '[._]') | ForEach-Object { [int]($_ -replace '\D', '0') }
     $maxLen = [Math]::Max($instParts.Count, $latestParts.Count)
@@ -176,14 +207,12 @@ if ($javaUpToDate -and $existingJava) {
 }
 Write-Host "JAVA_HOME will be set to: $javaHome"
 
-$scope = if ($isAdmin) { "Machine" } else { "User" }
-[Environment]::SetEnvironmentVariable("JAVA_HOME", $javaHome, $scope)
-
-$currentPath = [Environment]::GetEnvironmentVariable("Path", $scope)
+[Environment]::SetEnvironmentVariable("JAVA_HOME", $javaHome, "Machine")
+$currentPath = [Environment]::GetEnvironmentVariable("Path", "Machine")
 if ($currentPath -notlike "*$javaHome\bin*") {
-    [Environment]::SetEnvironmentVariable("Path", "$currentPath;$javaHome\bin", $scope)
+    [Environment]::SetEnvironmentVariable("Path", "$currentPath;$javaHome\bin", "Machine")
 }
-Write-Host "JAVA_HOME and PATH set at $scope scope."
+Write-Host "JAVA_HOME and PATH set at Machine scope."
 
 $Env:JAVA_HOME = $javaHome
 $Env:PATH = "$javaHome\bin;$Env:PATH"
@@ -209,7 +238,6 @@ if (-not $winUrl) {
     throw "Could not auto-detect the Data Loader download URL. Get it manually from $dataLoaderPage"
 }
 
-# Pull the version number out of the zip filename, e.g. dataloader-59.2.0.zip -> 59.2.0
 $latestDataLoaderVersion = $null
 if ($winUrl -match '(\d+(?:\.\d+)+)') {
     $latestDataLoaderVersion = $matches[1]
@@ -217,12 +245,6 @@ if ($winUrl -match '(\d+(?:\.\d+)+)') {
 Write-Host "Latest Data Loader available: $(if ($latestDataLoaderVersion) { $latestDataLoaderVersion } else { '(version unknown, will treat as needing install)' })"
 
 function Find-InstalledDataLoader {
-    <#
-        Searches common install locations (not just one fixed folder) so this
-        works regardless of where a prior install put things: Desktop,
-        Program Files (x86/64), user profile, and the root of each fixed
-        drive's top level, looking for a dataloader jar or version marker.
-    #>
     $searchRoots = @(
         [Environment]::GetFolderPath("Desktop"),
         $Env:ProgramFiles,
@@ -257,16 +279,12 @@ if ($existingDataLoader) {
     Write-Host "No existing Data Loader installation detected."
 }
 
-# ---------------------------------------------------------------------------
-# Decide overall outcome: if BOTH are already latest, notify + pause instead
-# of re-downloading anything. Otherwise install/update whichever is needed.
-# ---------------------------------------------------------------------------
 if ($javaUpToDate -and $dataLoaderUpToDate) {
     $msg = "Both Azul Zulu JRE ($($existingJava.Version)) and Salesforce Data Loader " +
            "($($existingDataLoader.Version)) are already up to date. No changes were made."
     Write-Host "`n$msg" -ForegroundColor Green
     Show-Popup -message $msg -title "Nothing to install"
-    Write-Host "Exiting - press Enter to close." 
+    Write-Host "Exiting - press Enter to close."
     if (-not $Silent) { Read-Host | Out-Null }
     exit 0
 }
