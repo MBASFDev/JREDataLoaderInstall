@@ -9,8 +9,7 @@
       - If NEITHER Java nor Data Loader is found -> installs both (latest).
       - If EITHER is found but out of date -> updates whichever is out of date.
       - If BOTH are found and already latest -> shows a pop-up confirming this
-        and pauses, waiting for the user to click OK, then exits without
-        re-downloading anything.
+        and exits without re-downloading anything.
 #>
 
 [CmdletBinding()]
@@ -34,11 +33,133 @@ function Show-Popup($message, $title = "Installer") {
         [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
 }
 
+function Find-JavaExe {
+    <#
+        Looks for an existing java.exe in several ways, since Java isn't
+        always on PATH or JAVA_HOME after install:
+          1. java on PATH
+          2. an existing JAVA_HOME (machine or user scope)
+          3. a direct filesystem search of common install locations,
+             checking the fast-path "<root>\bin\java.exe" first, falling
+             back to an error-tolerant recursive search.
+    #>
+    $javaCmd = Get-Command java -ErrorAction SilentlyContinue
+    if ($javaCmd) { return $javaCmd.Source }
+
+    $existingHome = [Environment]::GetEnvironmentVariable("JAVA_HOME", "Machine")
+    if (-not $existingHome) { $existingHome = [Environment]::GetEnvironmentVariable("JAVA_HOME", "User") }
+    if ($existingHome) {
+        $candidate = Join-Path $existingHome "bin\java.exe"
+        if (Test-Path $candidate) { return $candidate }
+    }
+
+    $searchRoots = @(
+        "$Env:ProgramFiles\Zulu",
+        "${Env:ProgramFiles(x86)}\Zulu",
+        "$Env:ProgramFiles\Java",
+        "${Env:ProgramFiles(x86)}\Java",
+        "$Env:ProgramFiles\Eclipse Adoptium",
+        "$Env:ProgramFiles\Microsoft\jdk*"
+    ) | Where-Object { $_ -and (Test-Path $_) }
+
+    foreach ($root in $searchRoots) {
+        $direct = Join-Path $root "bin\java.exe"
+        if (Test-Path $direct) { return $direct }
+
+        $found = Get-ChildItem -Path $root -Filter "java.exe" -Recurse -Force -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -match '\\bin\\java\.exe$' } |
+                 Select-Object -First 1
+        if ($found) { return $found.FullName }
+    }
+
+    return $null
+}
+
+function Get-InstalledJavaVersion {
+    $javaExePath = Find-JavaExe
+    if (-not $javaExePath) { return $null }
+
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $verOutput = & $javaExePath -version 2>&1 | Select-Object -First 1
+        if ($verOutput -match '"([\d\._]+)"') {
+            return @{ Version = $matches[1]; Path = $javaExePath }
+        }
+    } catch {
+        return $null
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+    return $null
+}
+
+function Compare-VersionStrings($installed, $latest) {
+    $instParts   = ($installed -split '[._]') | ForEach-Object { [int]($_ -replace '\D', '0') }
+    $latestParts = ($latest    -split '[._]') | ForEach-Object { [int]($_ -replace '\D', '0') }
+    $maxLen = [Math]::Max($instParts.Count, $latestParts.Count)
+    for ($i = 0; $i -lt $maxLen; $i++) {
+        $a = if ($i -lt $instParts.Count)   { $instParts[$i] }   else { 0 }
+        $b = if ($i -lt $latestParts.Count) { $latestParts[$i] } else { 0 }
+        if ($a -lt $b) { return $false }
+        if ($a -gt $b) { return $true }
+    }
+    return $true
+}
+
+function Get-JarManifestVersion($jarPath) {
+    # Reads Implementation-Version out of the jar's own MANIFEST.MF instead of
+    # trusting the filename - survives naming changes across releases.
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($jarPath)
+        try {
+            $entry = $zip.Entries | Where-Object { $_.FullName -eq "META-INF/MANIFEST.MF" } | Select-Object -First 1
+            if (-not $entry) { return $null }
+            $reader = New-Object System.IO.StreamReader($entry.Open())
+            try {
+                $manifest = $reader.ReadToEnd()
+            } finally {
+                $reader.Dispose()
+            }
+            if ($manifest -match 'Implementation-Version:\s*(\S+)') { return $matches[1] }
+        } finally {
+            $zip.Dispose()
+        }
+    } catch {
+        return $null
+    }
+    return $null
+}
+
+function Find-InstalledDataLoader {
+    $searchRoots = @(
+        [Environment]::GetFolderPath("Desktop"),
+        $Env:ProgramFiles,
+        ${Env:ProgramFiles(x86)},
+        $Env:USERPROFILE,
+        "C:\"
+    ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
+
+    foreach ($root in $searchRoots) {
+        $jars = Get-ChildItem -Path $root -Filter "dataloader*.jar" -Recurse -Depth 4 -Force -ErrorAction SilentlyContinue
+        foreach ($jar in $jars) {
+            $version = Get-JarManifestVersion -jarPath $jar.FullName
+            if ($version) { return @{ Version = $version; Path = $jar.FullName } }
+            # Fallback: parse the filename if the manifest lookup didn't pan out
+            if ($jar.Name -match 'dataloader-?(\d+(?:\.\d+)+)') {
+                return @{ Version = $matches[1]; Path = $jar.FullName }
+            }
+        }
+    }
+    return $null
+}
+
 # ---------------------------------------------------------------------------
 # PHASE 0: Ensure the script is running elevated (Administrator).
 # If not, prompt the user to confirm, then relaunch elevated automatically.
-# This works whether the script was downloaded and run locally, or invoked
-# via "irm <url> | iex" (in that case we re-launch using the same URL).
+# Works whether the script was downloaded and run locally, or invoked via
+# "irm <url> | iex" (in that case we re-launch using the same URL).
 # ---------------------------------------------------------------------------
 if (-not (Test-Admin)) {
     Add-Type -AssemblyName System.Windows.Forms | Out-Null
@@ -78,9 +199,11 @@ try {
 Write-Host "=== Phase 1: Detecting system specifications ===" -ForegroundColor Cyan
 
 $arch = $Env:PROCESSOR_ARCHITECTURE
-if ($arch -eq "AMD64") { $zuluArch = "x64" }
-elseif ($arch -eq "ARM64") { $zuluArch = "aarch64" }
-else { $zuluArch = "x86" }
+switch ($arch) {
+    "AMD64" { $zuluArch = "x64" }
+    "ARM64" { $zuluArch = "aarch64" }
+    default { $zuluArch = "x86" }
+}
 
 Write-Host "Detected OS: Windows | Arch: $zuluArch"
 Write-Host "Running as Administrator: $true"
@@ -120,75 +243,6 @@ $detail = Invoke-RestMethod -Uri "$azulApi$pkgUuid" -Method Get
 $downloadUrl = $detail.download_url
 $latestJavaVersion = ($detail.java_version -join ".")
 Write-Host "Latest Azul Zulu JRE available: $latestJavaVersion"
-
-function Get-InstalledJavaVersion {
-    <#
-        Looks for an existing Java install in several ways, since Java isn't
-        always on PATH or JAVA_HOME after install:
-          1. java on PATH
-          2. an existing JAVA_HOME (machine or user scope)
-          3. a direct filesystem search of common install locations
-             (Program Files, Program Files (x86), the Zulu default folder,
-             and the classic "Java" vendor folder), regardless of PATH.
-    #>
-    $javaExePath = $null
-
-    $javaCmd = Get-Command java -ErrorAction SilentlyContinue
-    if ($javaCmd) {
-        $javaExePath = $javaCmd.Source
-    }
-
-    if (-not $javaExePath) {
-        $existingHome = [Environment]::GetEnvironmentVariable("JAVA_HOME", "Machine")
-        if (-not $existingHome) { $existingHome = [Environment]::GetEnvironmentVariable("JAVA_HOME", "User") }
-        if ($existingHome -and (Test-Path (Join-Path $existingHome "bin\java.exe"))) {
-            $javaExePath = Join-Path $existingHome "bin\java.exe"
-        }
-    }
-
-    if (-not $javaExePath) {
-        $searchRoots = @(
-            "$Env:ProgramFiles\Zulu",
-            "${Env:ProgramFiles(x86)}\Zulu",
-            "$Env:ProgramFiles\Java",
-            "${Env:ProgramFiles(x86)}\Java",
-            "$Env:ProgramFiles\Eclipse Adoptium",
-            "$Env:ProgramFiles\Microsoft\jdk*"
-        ) | Where-Object { $_ -and (Test-Path $_) }
-
-        foreach ($root in $searchRoots) {
-            $found = Get-ChildItem -Path $root -Filter "java.exe" -Recurse -ErrorAction SilentlyContinue |
-                     Where-Object { $_.FullName -match '\\bin\\java\.exe$' } |
-                     Select-Object -First 1
-            if ($found) { $javaExePath = $found.FullName; break }
-        }
-    }
-
-    if (-not $javaExePath) { return $null }
-
-    try {
-        $verOutput = & $javaExePath -version 2>&1 | Select-Object -First 1
-        if ($verOutput -match '"([\d\._]+)"') {
-            return @{ Version = $matches[1]; Path = $javaExePath }
-        }
-    } catch {
-        return $null
-    }
-    return $null
-}
-
-function Compare-VersionStrings($installed, $latest) {
-    $instParts = ($installed -split '[._]') | ForEach-Object { [int]($_ -replace '\D', '0') }
-    $latestParts = ($latest -split '[._]') | ForEach-Object { [int]($_ -replace '\D', '0') }
-    $maxLen = [Math]::Max($instParts.Count, $latestParts.Count)
-    for ($i = 0; $i -lt $maxLen; $i++) {
-        $a = if ($i -lt $instParts.Count) { $instParts[$i] } else { 0 }
-        $b = if ($i -lt $latestParts.Count) { $latestParts[$i] } else { 0 }
-        if ($a -lt $b) { return $false }
-        if ($a -gt $b) { return $true }
-    }
-    return $true
-}
 
 $existingJava = Get-InstalledJavaVersion
 $javaUpToDate = $false
@@ -230,7 +284,7 @@ Write-Host "`n=== Phase 3b: Configuring JAVA_HOME / PATH ===" -ForegroundColor C
 if ($javaUpToDate -and $existingJava) {
     $javaHome = (Get-Item $existingJava.Path).Directory.Parent.FullName
 } else {
-    $javaExe = Get-ChildItem -Path $InstallDir -Filter "java.exe" -Recurse -ErrorAction SilentlyContinue |
+    $javaExe = Get-ChildItem -Path $InstallDir -Filter "java.exe" -Recurse -Force -ErrorAction SilentlyContinue |
                Select-Object -First 1
     if (-not $javaExe) {
         throw "Could not locate java.exe under $InstallDir after install."
@@ -260,40 +314,40 @@ Write-Host "Verifying Java install ..."
 Write-Host "`n=== Phase 4: Checking / Installing Salesforce Data Loader ===" -ForegroundColor Cyan
 
 $dataLoaderPage = "https://developer.salesforce.com/tools/data-loader"
-Write-Host "Fetching Data Loader page to find the latest Windows download link ..."
-$html = Invoke-WebRequest -Uri $dataLoaderPage -UseBasicParsing | Select-Object -ExpandProperty Content
+$releasesApi = "https://api.github.com/repos/forcedotcom/dataloader/releases/latest"
+Write-Host "Querying the Data Loader GitHub releases API for the latest version ..."
 
-$dlMatches = [regex]::Matches($html, 'https://[^\s"''<>]+dataloader[^\s"''<>]*\.zip', 'IgnoreCase')
-$winUrl = $dlMatches | Where-Object { $_.Value -match "win" } | Select-Object -First 1 -ExpandProperty Value
-if (-not $winUrl -and $dlMatches.Count -gt 0) { $winUrl = $dlMatches[0].Value }
-if (-not $winUrl) {
-    throw "Could not auto-detect the Data Loader download URL. Get it manually from $dataLoaderPage"
+$winUrl = $null
+$latestDataLoaderVersion = $null
+try {
+    $releaseInfo = Invoke-RestMethod -Uri $releasesApi -Headers @{ "User-Agent" = "PowerShell" }
+    $latestDataLoaderVersion = $releaseInfo.tag_name -replace '^v', ''
+    $winAsset = $releaseInfo.assets |
+        Where-Object { $_.name -match '\.zip$' -and $_.name -match 'win' } |
+        Select-Object -First 1
+    if (-not $winAsset) {
+        # some releases don't tag "win" in the name - fall back to any zip asset
+        $winAsset = $releaseInfo.assets | Where-Object { $_.name -match '\.zip$' } | Select-Object -First 1
+    }
+    if ($winAsset) { $winUrl = $winAsset.browser_download_url }
+} catch {
+    Write-Host "GitHub releases API lookup failed, falling back to scraping the download page ..." -ForegroundColor Yellow
 }
 
-$latestDataLoaderVersion = $null
-if ($winUrl -match '(\d+(?:\.\d+)+)') {
-    $latestDataLoaderVersion = $matches[1]
+if (-not $winUrl) {
+    Write-Host "Fetching Data Loader page to find the latest Windows download link ..."
+    $html = Invoke-WebRequest -Uri $dataLoaderPage -UseBasicParsing | Select-Object -ExpandProperty Content
+    $dlMatches = [regex]::Matches($html, 'https://[^\s"''<>]+dataloader[^\s"''<>]*\.zip', 'IgnoreCase')
+    $winUrl = $dlMatches | Where-Object { $_.Value -match "win" } | Select-Object -First 1 -ExpandProperty Value
+    if (-not $winUrl -and $dlMatches.Count -gt 0) { $winUrl = $dlMatches[0].Value }
+    if (-not $winUrl) {
+        throw "Could not auto-detect the Data Loader download URL. Get it manually from $dataLoaderPage"
+    }
+    if (-not $latestDataLoaderVersion -and $winUrl -match '(\d+(?:\.\d+)+)') {
+        $latestDataLoaderVersion = $matches[1]
+    }
 }
 Write-Host "Latest Data Loader available: $(if ($latestDataLoaderVersion) { $latestDataLoaderVersion } else { '(version unknown, will treat as needing install)' })"
-
-function Find-InstalledDataLoader {
-    $searchRoots = @(
-        [Environment]::GetFolderPath("Desktop"),
-        $Env:ProgramFiles,
-        ${Env:ProgramFiles(x86)},
-        $Env:USERPROFILE,
-        "C:\"
-    ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
-
-    foreach ($root in $searchRoots) {
-        $jar = Get-ChildItem -Path $root -Filter "dataloader-*.jar" -Recurse -Depth 4 -ErrorAction SilentlyContinue |
-               Select-Object -First 1
-        if ($jar -and $jar.Name -match 'dataloader-(\d+(?:\.\d+)+)') {
-            return @{ Version = $matches[1]; Path = $jar.FullName }
-        }
-    }
-    return $null
-}
 
 Write-Host "Searching common locations for an existing Data Loader install ..."
 $existingDataLoader = Find-InstalledDataLoader
@@ -316,8 +370,6 @@ if ($javaUpToDate -and $dataLoaderUpToDate) {
            "($($existingDataLoader.Version)) are already up to date. No changes were made."
     Write-Host "`n$msg" -ForegroundColor Green
     Show-Popup -message $msg -title "Nothing to install"
-    Write-Host "Exiting - press Enter to close."
-    if (-not $Silent) { Read-Host | Out-Null }
     exit 0
 }
 
@@ -327,7 +379,18 @@ if (-not $dataLoaderUpToDate) {
     Write-Host "Downloading: $winUrl"
     Invoke-WebRequest -Uri $winUrl -OutFile $tempZip -UseBasicParsing
 
-    $extractDir = Join-Path $desktopDir "dataloader_extracted"
+    $versionSuffix = if ($latestDataLoaderVersion) { "v$latestDataLoaderVersion" } else { "v_unknown" }
+    $extractDir = Join-Path $desktopDir "dataloader_$versionSuffix"
+
+    # Clean up any older dataloader_v* folders on the Desktop so we don't
+    # leave stale/outdated installs lying around after an upgrade.
+    $oldVersionDirs = Get-ChildItem -Path $desktopDir -Directory -Filter "dataloader_v*" -ErrorAction SilentlyContinue |
+                       Where-Object { $_.FullName -ne $extractDir }
+    foreach ($oldDir in $oldVersionDirs) {
+        Write-Host "Removing outdated Data Loader folder: $($oldDir.FullName)"
+        Remove-Item $oldDir.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
     Remove-Item $extractDir -Recurse -Force -ErrorAction SilentlyContinue
     Expand-Archive -Path $tempZip -DestinationPath $extractDir -Force
     Write-Host "Data Loader package extracted to: $extractDir"
