@@ -122,17 +122,48 @@ $latestJavaVersion = ($detail.java_version -join ".")
 Write-Host "Latest Azul Zulu JRE available: $latestJavaVersion"
 
 function Get-InstalledJavaVersion {
-    $javaCmd = Get-Command java -ErrorAction SilentlyContinue
+    <#
+        Looks for an existing Java install in several ways, since Java isn't
+        always on PATH or JAVA_HOME after install:
+          1. java on PATH
+          2. an existing JAVA_HOME (machine or user scope)
+          3. a direct filesystem search of common install locations
+             (Program Files, Program Files (x86), the Zulu default folder,
+             and the classic "Java" vendor folder), regardless of PATH.
+    #>
     $javaExePath = $null
+
+    $javaCmd = Get-Command java -ErrorAction SilentlyContinue
     if ($javaCmd) {
         $javaExePath = $javaCmd.Source
-    } else {
+    }
+
+    if (-not $javaExePath) {
         $existingHome = [Environment]::GetEnvironmentVariable("JAVA_HOME", "Machine")
         if (-not $existingHome) { $existingHome = [Environment]::GetEnvironmentVariable("JAVA_HOME", "User") }
         if ($existingHome -and (Test-Path (Join-Path $existingHome "bin\java.exe"))) {
             $javaExePath = Join-Path $existingHome "bin\java.exe"
         }
     }
+
+    if (-not $javaExePath) {
+        $searchRoots = @(
+            "$Env:ProgramFiles\Zulu",
+            "${Env:ProgramFiles(x86)}\Zulu",
+            "$Env:ProgramFiles\Java",
+            "${Env:ProgramFiles(x86)}\Java",
+            "$Env:ProgramFiles\Eclipse Adoptium",
+            "$Env:ProgramFiles\Microsoft\jdk*"
+        ) | Where-Object { $_ -and (Test-Path $_) }
+
+        foreach ($root in $searchRoots) {
+            $found = Get-ChildItem -Path $root -Filter "java.exe" -Recurse -ErrorAction SilentlyContinue |
+                     Where-Object { $_.FullName -match '\\bin\\java\.exe$' } |
+                     Select-Object -First 1
+            if ($found) { $javaExePath = $found.FullName; break }
+        }
+    }
+
     if (-not $javaExePath) { return $null }
 
     try {
