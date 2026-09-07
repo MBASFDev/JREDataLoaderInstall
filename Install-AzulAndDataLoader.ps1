@@ -1,0 +1,304 @@
+<#
+.SYNOPSIS
+    Automated installer: Azul Zulu JRE (latest) + Salesforce Data Loader (latest).
+    Windows version - uses only built-in PowerShell/Windows tools, no Python required.
+
+.NOTES
+    Run in an elevated (Administrator) PowerShell for a system-wide install and
+    machine-wide JAVA_HOME. Run without elevation for a per-user install.
+
+    Behavior summary:
+      - If NEITHER Java nor Data Loader is found -> installs both (latest).
+      - If EITHER is found but out of date -> updates whichever is out of date.
+      - If BOTH are found and already latest -> shows a pop-up confirming this
+        and pauses, waiting for the user to click OK, then exits without
+        re-downloading anything.
+#>
+
+[CmdletBinding()]
+param(
+    [string]$InstallDir = "$Env:ProgramFiles\Zulu",
+    [switch]$Silent   # skip the directory prompt, just use $InstallDir / default
+)
+
+$ErrorActionPreference = "Stop"
+
+function Test-Admin {
+    $id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $p  = New-Object System.Security.Principal.WindowsPrincipal($id)
+    return $p.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Show-Popup($message, $title = "Installer") {
+    Add-Type -AssemblyName System.Windows.Forms | Out-Null
+    [System.Windows.Forms.MessageBox]::Show($message, $title, `
+        [System.Windows.Forms.MessageBoxButtons]::OK, `
+        [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+}
+
+# ---------------------------------------------------------------------------
+# PHASE 1: Detect system specs
+# ---------------------------------------------------------------------------
+Write-Host "=== Phase 1: Detecting system specifications ===" -ForegroundColor Cyan
+
+$arch = $Env:PROCESSOR_ARCHITECTURE
+if ($arch -eq "AMD64") { $zuluArch = "x64" }
+elseif ($arch -eq "ARM64") { $zuluArch = "aarch64" }
+else { $zuluArch = "x86" }
+
+Write-Host "Detected OS: Windows | Arch: $zuluArch"
+$isAdmin = Test-Admin
+Write-Host "Running as Administrator: $isAdmin"
+
+# ---------------------------------------------------------------------------
+# PHASE 2: Prompt for install directory
+# ---------------------------------------------------------------------------
+Write-Host "`n=== Phase 2: Choose install directory ===" -ForegroundColor Cyan
+Write-Host "Default: $InstallDir"
+
+if (-not $Silent) {
+    $userInput = Read-Host "Press Enter to accept the default, or type a custom path"
+    if ($userInput.Trim().Length -gt 0) { $InstallDir = $userInput.Trim() }
+}
+New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+Write-Host "Using install directory: $InstallDir"
+
+# ---------------------------------------------------------------------------
+# PHASE 3: Check for an existing Java install, skip if already latest,
+#          otherwise download + install latest Azul Zulu JRE (MSI)
+# ---------------------------------------------------------------------------
+Write-Host "`n=== Phase 3: Checking / Installing Azul Zulu JRE ===" -ForegroundColor Cyan
+
+$azulApi = "https://api.azul.com/metadata/v1/zulu/packages/"
+$queryParams = "java_package_type=jre&os=windows&arch=$zuluArch&archive_type=msi&latest=true&release_status=ga&availability_types=CA&page=1&page_size=1"
+$metaUrl = "$azulApi`?$queryParams"
+
+Write-Host "Querying Azul metadata API for the latest JRE version ..."
+$packages = Invoke-RestMethod -Uri $metaUrl -Method Get
+
+if (-not $packages -or $packages.Count -eq 0) {
+    throw "Could not find a matching Azul Zulu JRE MSI package. Check https://www.azul.com/downloads/ manually."
+}
+
+$pkgUuid = $packages[0].package_uuid
+$detail = Invoke-RestMethod -Uri "$azulApi$pkgUuid" -Method Get
+$downloadUrl = $detail.download_url
+$latestJavaVersion = ($detail.java_version -join ".")   # e.g. "21.0.4.7"
+Write-Host "Latest Azul Zulu JRE available: $latestJavaVersion"
+
+function Get-InstalledJavaVersion {
+    # Try java on PATH first, then a previously-set JAVA_HOME, so this works
+    # even if PATH hasn't been refreshed in the current session.
+    $javaCmd = Get-Command java -ErrorAction SilentlyContinue
+    $javaExePath = $null
+    if ($javaCmd) {
+        $javaExePath = $javaCmd.Source
+    } else {
+        $existingHome = [Environment]::GetEnvironmentVariable("JAVA_HOME", "Machine")
+        if (-not $existingHome) { $existingHome = [Environment]::GetEnvironmentVariable("JAVA_HOME", "User") }
+        if ($existingHome -and (Test-Path (Join-Path $existingHome "bin\java.exe"))) {
+            $javaExePath = Join-Path $existingHome "bin\java.exe"
+        }
+    }
+    if (-not $javaExePath) { return $null }
+
+    try {
+        $verOutput = & $javaExePath -version 2>&1 | Select-Object -First 1
+        if ($verOutput -match '"([\d\._]+)"') {
+            return @{ Version = $matches[1]; Path = $javaExePath }
+        }
+    } catch {
+        return $null
+    }
+    return $null
+}
+
+function Compare-VersionStrings($installed, $latest) {
+    # Returns $true if installed >= latest. Handles differing segment counts.
+    $instParts = ($installed -split '[._]') | ForEach-Object { [int]($_ -replace '\D', '0') }
+    $latestParts = ($latest -split '[._]') | ForEach-Object { [int]($_ -replace '\D', '0') }
+    $maxLen = [Math]::Max($instParts.Count, $latestParts.Count)
+    for ($i = 0; $i -lt $maxLen; $i++) {
+        $a = if ($i -lt $instParts.Count) { $instParts[$i] } else { 0 }
+        $b = if ($i -lt $latestParts.Count) { $latestParts[$i] } else { 0 }
+        if ($a -lt $b) { return $false }
+        if ($a -gt $b) { return $true }
+    }
+    return $true
+}
+
+$existingJava = Get-InstalledJavaVersion
+$javaUpToDate = $false
+
+if ($existingJava) {
+    Write-Host "Found existing Java install: version $($existingJava.Version) at $($existingJava.Path)"
+    if (Compare-VersionStrings -installed $existingJava.Version -latest $latestJavaVersion) {
+        Write-Host "Installed Java is already up to date (or newer)." -ForegroundColor Yellow
+        $javaUpToDate = $true
+    } else {
+        Write-Host "Installed Java ($($existingJava.Version)) is older than the latest ($latestJavaVersion) - will upgrade."
+    }
+} else {
+    Write-Host "No existing Java installation detected."
+}
+
+if (-not $javaUpToDate) {
+    $tempMsi = Join-Path $Env:TEMP "zulu_jre_installer.msi"
+    Write-Host "Downloading: $downloadUrl"
+    Invoke-WebRequest -Uri $downloadUrl -OutFile $tempMsi -UseBasicParsing
+
+    Write-Host "Installing MSI silently to $InstallDir ..."
+    $msiArgs = @("/i", "`"$tempMsi`"", "/qn", "INSTALLDIR=`"$InstallDir`"")
+    $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList $msiArgs -Wait -PassThru
+    if ($proc.ExitCode -ne 0) {
+        throw "msiexec failed with exit code $($proc.ExitCode). Try re-running this script as Administrator."
+    }
+    Remove-Item $tempMsi -Force -ErrorAction SilentlyContinue
+    Write-Host "Azul Zulu JRE installed/updated."
+} else {
+    Write-Host "Azul Zulu JRE install skipped (already latest)."
+}
+
+# ---------------------------------------------------------------------------
+# PHASE 3b: Locate JAVA_HOME and persist environment variables
+# ---------------------------------------------------------------------------
+Write-Host "`n=== Phase 3b: Configuring JAVA_HOME / PATH ===" -ForegroundColor Cyan
+
+if ($javaUpToDate -and $existingJava) {
+    $javaHome = (Get-Item $existingJava.Path).Directory.Parent.FullName
+} else {
+    $javaExe = Get-ChildItem -Path $InstallDir -Filter "java.exe" -Recurse -ErrorAction SilentlyContinue |
+               Select-Object -First 1
+    if (-not $javaExe) {
+        throw "Could not locate java.exe under $InstallDir after install."
+    }
+    $javaHome = $javaExe.Directory.Parent.FullName
+}
+Write-Host "JAVA_HOME will be set to: $javaHome"
+
+$scope = if ($isAdmin) { "Machine" } else { "User" }
+[Environment]::SetEnvironmentVariable("JAVA_HOME", $javaHome, $scope)
+
+$currentPath = [Environment]::GetEnvironmentVariable("Path", $scope)
+if ($currentPath -notlike "*$javaHome\bin*") {
+    [Environment]::SetEnvironmentVariable("Path", "$currentPath;$javaHome\bin", $scope)
+}
+Write-Host "JAVA_HOME and PATH set at $scope scope."
+
+$Env:JAVA_HOME = $javaHome
+$Env:PATH = "$javaHome\bin;$Env:PATH"
+
+Write-Host "Verifying Java install ..."
+& "$javaHome\bin\java.exe" -version
+
+# ---------------------------------------------------------------------------
+# PHASE 4: Check for an existing Data Loader install anywhere on the system,
+#          compare with the latest available version, and only download +
+#          reinstall if missing or outdated.
+# ---------------------------------------------------------------------------
+Write-Host "`n=== Phase 4: Checking / Installing Salesforce Data Loader ===" -ForegroundColor Cyan
+
+$dataLoaderPage = "https://developer.salesforce.com/tools/data-loader"
+Write-Host "Fetching Data Loader page to find the latest Windows download link ..."
+$html = Invoke-WebRequest -Uri $dataLoaderPage -UseBasicParsing | Select-Object -ExpandProperty Content
+
+$dlMatches = [regex]::Matches($html, 'https://[^\s"''<>]+dataloader[^\s"''<>]*\.zip', 'IgnoreCase')
+$winUrl = $dlMatches | Where-Object { $_.Value -match "win" } | Select-Object -First 1 -ExpandProperty Value
+if (-not $winUrl -and $dlMatches.Count -gt 0) { $winUrl = $dlMatches[0].Value }
+if (-not $winUrl) {
+    throw "Could not auto-detect the Data Loader download URL. Get it manually from $dataLoaderPage"
+}
+
+# Pull the version number out of the zip filename, e.g. dataloader-59.2.0.zip -> 59.2.0
+$latestDataLoaderVersion = $null
+if ($winUrl -match '(\d+(?:\.\d+)+)') {
+    $latestDataLoaderVersion = $matches[1]
+}
+Write-Host "Latest Data Loader available: $(if ($latestDataLoaderVersion) { $latestDataLoaderVersion } else { '(version unknown, will treat as needing install)' })"
+
+function Find-InstalledDataLoader {
+    <#
+        Searches common install locations (not just one fixed folder) so this
+        works regardless of where a prior install put things: Desktop,
+        Program Files (x86/64), user profile, and the root of each fixed
+        drive's top level, looking for a dataloader jar or version marker.
+    #>
+    $searchRoots = @(
+        [Environment]::GetFolderPath("Desktop"),
+        $Env:ProgramFiles,
+        ${Env:ProgramFiles(x86)},
+        $Env:USERPROFILE,
+        "C:\"
+    ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
+
+    foreach ($root in $searchRoots) {
+        $jar = Get-ChildItem -Path $root -Filter "dataloader-*.jar" -Recurse -Depth 4 -ErrorAction SilentlyContinue |
+               Select-Object -First 1
+        if ($jar -and $jar.Name -match 'dataloader-(\d+(?:\.\d+)+)') {
+            return @{ Version = $matches[1]; Path = $jar.FullName }
+        }
+    }
+    return $null
+}
+
+Write-Host "Searching common locations for an existing Data Loader install ..."
+$existingDataLoader = Find-InstalledDataLoader
+$dataLoaderUpToDate = $false
+
+if ($existingDataLoader) {
+    Write-Host "Found existing Data Loader: version $($existingDataLoader.Version) at $($existingDataLoader.Path)"
+    if ($latestDataLoaderVersion -and (Compare-VersionStrings -installed $existingDataLoader.Version -latest $latestDataLoaderVersion)) {
+        Write-Host "Installed Data Loader is already up to date (or newer)." -ForegroundColor Yellow
+        $dataLoaderUpToDate = $true
+    } else {
+        Write-Host "Installed Data Loader ($($existingDataLoader.Version)) is older than the latest ($latestDataLoaderVersion) - will upgrade."
+    }
+} else {
+    Write-Host "No existing Data Loader installation detected."
+}
+
+# ---------------------------------------------------------------------------
+# Decide overall outcome: if BOTH are already latest, notify + pause instead
+# of re-downloading anything. Otherwise install/update whichever is needed.
+# ---------------------------------------------------------------------------
+if ($javaUpToDate -and $dataLoaderUpToDate) {
+    $msg = "Both Azul Zulu JRE ($($existingJava.Version)) and Salesforce Data Loader " +
+           "($($existingDataLoader.Version)) are already up to date. No changes were made."
+    Write-Host "`n$msg" -ForegroundColor Green
+    Show-Popup -message $msg -title "Nothing to install"
+    Write-Host "Exiting - press Enter to close." 
+    if (-not $Silent) { Read-Host | Out-Null }
+    exit 0
+}
+
+if (-not $dataLoaderUpToDate) {
+    $desktopDir = [Environment]::GetFolderPath("Desktop")
+    $tempZip = Join-Path $desktopDir "dataloader.zip"
+    Write-Host "Downloading: $winUrl"
+    Invoke-WebRequest -Uri $winUrl -OutFile $tempZip -UseBasicParsing
+
+    $extractDir = Join-Path $desktopDir "dataloader_extracted"
+    Remove-Item $extractDir -Recurse -Force -ErrorAction SilentlyContinue
+    Expand-Archive -Path $tempZip -DestinationPath $extractDir -Force
+    Write-Host "Data Loader package extracted to: $extractDir"
+
+    $installScript = Get-ChildItem -Path $extractDir -Filter "install.bat" -Recurse | Select-Object -First 1
+    if (-not $installScript) {
+        throw "Could not find install.bat in the downloaded Data Loader package."
+    }
+
+    Write-Host "Running Data Loader installer: $($installScript.FullName)"
+    Push-Location $installScript.Directory.FullName
+    try {
+        & $installScript.FullName
+    } finally {
+        Pop-Location
+    }
+    Write-Host "Data Loader installed/updated."
+} else {
+    Write-Host "Data Loader install skipped (already latest)."
+}
+
+Write-Host "`n=== All installations complete! ===" -ForegroundColor Green
+Write-Host "JAVA_HOME: $javaHome"
+Write-Host "Open a new terminal session for PATH changes to take effect elsewhere."
