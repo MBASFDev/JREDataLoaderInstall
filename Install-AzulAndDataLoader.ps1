@@ -56,13 +56,13 @@ if (-not (Test-Admin)) {
         # local file) - in that case, relaunch by re-downloading + running
         # from the same URL. Otherwise, relaunch the local script file.
         if ($PSCommandPath) {
-            $relaunchArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$PSCommandPath`"")
+            $relaunchArgs = @("-NoExit", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$PSCommandPath`"")
             if ($Silent) { $relaunchArgs += "-Silent" }
             Start-Process -FilePath "powershell.exe" -ArgumentList $relaunchArgs -Verb RunAs
         } else {
             $scriptUrl = "https://raw.githubusercontent.com/MBASFDev/JREDataLoaderInstall/main/Install-AzulAndDataLoader.ps1"
             $relaunchCmd = "irm $scriptUrl | iex"
-            Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $relaunchCmd) -Verb RunAs
+            Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoExit", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $relaunchCmd) -Verb RunAs
         }
         exit 0
     } else {
@@ -71,6 +71,7 @@ if (-not (Test-Admin)) {
     }
 }
 
+try {
 # ---------------------------------------------------------------------------
 # PHASE 1: Detect system specs
 # ---------------------------------------------------------------------------
@@ -320,3 +321,11 @@ if (-not $dataLoaderUpToDate) {
 Write-Host "`n=== All installations complete! ===" -ForegroundColor Green
 Write-Host "JAVA_HOME: $javaHome"
 Write-Host "Open a new terminal session for PATH changes to take effect elsewhere."
+
+} catch {
+    Write-Host "`nERROR: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host $_.ScriptStackTrace -ForegroundColor DarkRed
+} finally {
+    Write-Host "`nPress Enter to close this window..."
+    Read-Host | Out-Null
+}
