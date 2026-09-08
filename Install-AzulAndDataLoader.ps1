@@ -183,6 +183,7 @@ if (-not (Test-Admin)) {
         } else {
             $scriptUrl = "https://raw.githubusercontent.com/MBASFDev/JREDataLoaderInstall/main/Install-AzulAndDataLoader.ps1"
             $relaunchCmd = "irm $scriptUrl | iex"
+            if ($Silent) { $relaunchCmd = "& { `$Silent = `$true; $relaunchCmd }" }
             Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoExit", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $relaunchCmd) -Verb RunAs
         }
         exit 0
@@ -267,8 +268,11 @@ if (-not $javaUpToDate) {
     Write-Host "Installing MSI silently to $InstallDir ..."
     $msiArgs = @("/i", "`"$tempMsi`"", "/qn", "INSTALLDIR=`"$InstallDir`"")
     $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList $msiArgs -Wait -PassThru
-    if ($proc.ExitCode -ne 0) {
+    if ($proc.ExitCode -notin @(0, 3010)) {
         throw "msiexec failed with exit code $($proc.ExitCode). Try re-running this script as Administrator."
+    }
+    if ($proc.ExitCode -eq 3010) {
+        Write-Host "Install succeeded but a reboot is recommended to fully apply changes." -ForegroundColor Yellow
     }
     Remove-Item $tempMsi -Force -ErrorAction SilentlyContinue
     Write-Host "Azul Zulu JRE installed/updated."
@@ -284,12 +288,11 @@ Write-Host "`n=== Phase 3b: Configuring JAVA_HOME / PATH ===" -ForegroundColor C
 if ($javaUpToDate -and $existingJava) {
     $javaHome = (Get-Item $existingJava.Path).Directory.Parent.FullName
 } else {
-    $javaExe = Get-ChildItem -Path $InstallDir -Filter "java.exe" -Recurse -Force -ErrorAction SilentlyContinue |
-               Select-Object -First 1
-    if (-not $javaExe) {
+    $javaExePath = Find-JavaExe
+    if (-not $javaExePath) {
         throw "Could not locate java.exe under $InstallDir after install."
     }
-    $javaHome = $javaExe.Directory.Parent.FullName
+    $javaHome = (Get-Item $javaExePath).Directory.Parent.FullName
 }
 Write-Host "JAVA_HOME will be set to: $javaHome"
 
@@ -393,6 +396,7 @@ if (-not $dataLoaderUpToDate) {
 
     Remove-Item $extractDir -Recurse -Force -ErrorAction SilentlyContinue
     Expand-Archive -Path $tempZip -DestinationPath $extractDir -Force
+    Remove-Item $tempZip -Force -ErrorAction SilentlyContinue
     Write-Host "Data Loader package extracted to: $extractDir"
 
     $installScript = Get-ChildItem -Path $extractDir -Filter "install.bat" -Recurse | Select-Object -First 1
