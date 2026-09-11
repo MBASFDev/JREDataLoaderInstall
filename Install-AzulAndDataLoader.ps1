@@ -385,6 +385,16 @@ if (-not $dataLoaderUpToDate) {
     $versionSuffix = if ($latestDataLoaderVersion) { "v$latestDataLoaderVersion" } else { "v_unknown" }
     $extractDir = Join-Path $desktopDir "dataloader_$versionSuffix"
 
+    # Clean up any leftover shortcuts pointing at an older Data Loader
+    # install (install.bat creates a Desktop shortcut for Data Loader) so
+    # upgrades don't leave a dead/duplicate shortcut behind.
+    $oldShortcuts = Get-ChildItem -Path $desktopDir -Filter "*.lnk" -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -match "Data ?Loader" }
+    foreach ($shortcut in $oldShortcuts) {
+        Write-Host "Removing outdated Data Loader shortcut: $($shortcut.FullName)"
+        Remove-Item $shortcut.FullName -Force -ErrorAction SilentlyContinue
+    }
+
     # Clean up any older dataloader_v* folders on the Desktop so we don't
     # leave stale/outdated installs lying around after an upgrade.
     $oldVersionDirs = Get-ChildItem -Path $desktopDir -Directory -Filter "dataloader_v*" -ErrorAction SilentlyContinue |
